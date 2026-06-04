@@ -1,0 +1,6 @@
+.env
+alert_state.json
+__pycache__/
+*.pyc
+run.log
+*.tmp
