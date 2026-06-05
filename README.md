@@ -129,6 +129,15 @@ minutes before the cutoff.
 Yahoo Finance (yfinance), NSE `allIndices`, [mfapi.in](https://www.mfapi.in/) (mutual-fund NAV),
 CNN Fear & Greed, Tickertape Market Mood Index, and Google News RSS — all public, keyless endpoints.
 
+## Tests
+
+No network or credentials required — the module imports cleanly (`yfinance` is loaded lazily, only at
+fetch time), so the signal engine is unit-tested in isolation:
+
+​```bash
+python -m unittest discover -s tests -v
+​```
+
 ## Known limitations & future work
 
 Where the happy path ends — these are deliberate scope choices for a personal, low-noise alerter,
