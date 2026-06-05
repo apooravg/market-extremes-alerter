@@ -131,12 +131,11 @@ CNN Fear & Greed, Tickertape Market Mood Index, and Google News RSS — all publ
 
 ## Tests
 
-No network or credentials required — the module imports cleanly (`yfinance` is loaded lazily, only at
-fetch time), so the signal engine is unit-tested in isolation:
+No network or credentials required — the module imports cleanly (`yfinance` is loaded lazily, only at fetch time), so the signal engine is unit-tested in isolation:
 
-​```bash
+```bash
 python -m unittest discover -s tests -v
-​```
+```
 
 ## Known limitations & future work
 
