@@ -82,5 +82,20 @@ class TestWeekly(unittest.TestCase):
         self.assertFalse(ma.weekly_movers([_row("Nifty Smallcap250", wk=-0.020)]))
 
 
+class TestInfoTier(unittest.TestCase):
+    def test_asymmetric_band_and_dedup(self):
+        ds = {}
+        self.assertTrue(ma.info_move_alert("QQQ", -0.021, ds, "D"))   # -2.1% trips the -2% down band
+        self.assertFalse(ma.info_move_alert("QQQ", -0.021, ds, "D"))  # same day/side -> no repeat
+        self.assertFalse(ma.info_move_alert("QQQ", 0.020, ds, "D"))   # +2.0% is below the +2.5% up band
+        self.assertTrue(ma.info_move_alert("QQQ", 0.026, ds, "D"))    # +2.6% trips the up band
+
+
+class TestFinnhubFallback(unittest.TestCase):
+    def test_no_key_returns_none(self):
+        # with no FINNHUB_TOKEN, the quote returns (None, None) so the caller falls back to yfinance
+        self.assertEqual(ma.finnhub_quote("QQQ"), (None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

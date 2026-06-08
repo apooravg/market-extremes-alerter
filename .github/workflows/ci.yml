@@ -1,0 +1,25 @@
+name: CI
+
+# Manual-only (workflow_dispatch): GitHub Actions is disabled on this account pending a billing
+# fix, so we don't auto-run on push. To enable automated CI, restore the `push:`/`pull_request:`
+# triggers below. The tests themselves run locally with: python -m unittest discover -s tests
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      # The unit tests only need `requests`; yfinance is imported lazily at fetch time.
+      - run: pip install requests
+      - name: Byte-compile
+        run: python -m py_compile market_alerts.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v

@@ -1,6 +1,5 @@
 # Market Extremes Alerter
 
-[![CI](https://github.com/apooravg/market-extremes-alerter/actions/workflows/ci.yml/badge.svg)](https://github.com/apooravg/market-extremes-alerter/actions/workflows/ci.yml)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org)
 
@@ -52,6 +51,8 @@ The fill-bar shows position in the 52-week range (`▰` filled = near the high).
 - **A gated snapshot** that only sends on a fresh tier crossing, a risk/cross banner, a notable
   daily/weekly move, or a periodic reminder — plus an optional **cutoff-sequence** of re-runs for
   markets with a daily mutual-fund NAV cutoff (alert only on *fresh* movement vs the day's anchor).
+- **An FYI / awareness tier** — a gentle, asymmetric “the market moved” ping (no implied
+  trade), so a notable day registers without nagging like an actionable alert.
 - **Sentiment & trend overlays** — RISK-ON/RISK-OFF banners (CNN Fear & Greed + India MMI), a
   golden/death cross detector, and a "Mood index" with fear/greed fill-bars and trend arrows.
 - **Production hygiene** — atomic, crash-safe JSON state; pooled HTTP connections; once-a-day caching
@@ -88,6 +89,19 @@ python market_alerts.py --calibrate   # dry-run: print current DMA distances (no
 Create a Telegram bot with [@BotFather](https://t.me/BotFather) for the token; add the bot to your
 chat/group and use that chat id (group ids are negative).
 
+## Tests
+
+Unit tests cover the core signal logic — tier classification, the escalate-only state machine, the
+range/mood fill-bars, the golden/death cross, and the multi-day trigger. They need no network or
+credentials (`market_alerts.py` imports cleanly; `yfinance` is loaded lazily, only at fetch time):
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+A GitHub Actions workflow is included under `.github/workflows/` (matrix-tested across Python
+3.9–3.12); it is currently manual-only — flip its trigger back to `push` once Actions is enabled.
+
 ## Configuration
 
 Everything is in the dicts near the top of `market_alerts.py`:
@@ -122,20 +136,14 @@ minutes before the cutoff.
 | `--recheck` / `--cutoff` | Cutoff re-runs: fresh-move checks vs the day's anchor |
 | `--digest` | Force the full snapshot now |
 | `--calibrate` | Dry-run: print current DMA distances (no Telegram) |
+| `--poll` | Cron-driven inbound poll: reply to a `/status` (or `hi`, `digest`, ...) message with a digest |
 | `--test` / `--demo` | Delivery ping / sample message |
 
 ## Data sources
 
-Yahoo Finance (yfinance), NSE `allIndices`, [mfapi.in](https://www.mfapi.in/) (mutual-fund NAV),
+Yahoo Finance (yfinance), optionally [Finnhub](https://finnhub.io/) for a real-time US quote
+(set `FINNHUB_TOKEN`; falls back to yfinance), NSE `allIndices`, [mfapi.in](https://www.mfapi.in/) (mutual-fund NAV),
 CNN Fear & Greed, Tickertape Market Mood Index, and Google News RSS — all public, keyless endpoints.
-
-## Tests
-
-No network or credentials required — the module imports cleanly (`yfinance` is loaded lazily, only at fetch time), so the signal engine is unit-tested in isolation:
-
-```bash
-python -m unittest discover -s tests -v
-```
 
 ## Known limitations & future work
 

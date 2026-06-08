@@ -61,6 +61,7 @@ Row = namedtuple("Row", "glabel is_us snap name m side tier fire dmv crit eod nu
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")      # required — Telegram bot token from @BotFather
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID")    # required — target chat/group id (groups are negative)
+FINNHUB_TOKEN  = os.environ.get("FINNHUB_TOKEN", "")   # optional — real-time US quote (free, IEX); else yfinance
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_state.json")
 DIGEST_DATES = []
 
@@ -93,7 +94,7 @@ INDIA_IDX = {
 }
 US_IDX = {
     # Broad US-tech barometer. Buy dips sensitive; froth-sell only at a genuine top (+22/+30 vs 200DMA).
-    "Nasdaq100 (QQQ)":   {"src": "yf", "symbol": "QQQ", "wide": True, "critical": True,
+    "Nasdaq100 (QQQ)":   {"src": "yf", "symbol": "QQQ", "finnhub": "QQQ", "wide": True, "critical": True,
                           "sell": [0.22, 0.30], "sell_rearm": 0.15},
 }
 # Alert-only watch list (never shown in the snapshot; pings only on a tier cross). Empty by default.
@@ -134,8 +135,15 @@ SELL_REARM, SELL_REARM_WIDE = 0.08, 0.12
 DAILY_MOVE, DAILY_MOVE_WIDE = 0.016, 0.025
 # Overnight (after the local market close): wake only for a big single-day move, asymmetric -- a
 # downside shock is the actionable one; an upside rip needs to be bigger before it is worth a ping.
-LATE_DOWN = 0.04
-LATE_UP   = 0.06
+LATE_DOWN = 0.037   # overnight: -3.7% or worse pings (actionable)
+LATE_UP   = 0.053   # overnight: +5.3% or more pings
+
+# FYI / awareness tier — a gentle "the market moved" notice (no implied trade). Asymmetric (a drop
+# nags sooner than a rip), once/day/side, never double-fires with actionable alerts, self-caps ~11pm.
+INFO_DOWN   = 0.020
+INFO_UP     = 0.025
+INFO_CUTOFF = dt.time(23, 5)
+INFO_NAMES  = {"Nasdaq100 (QQQ)", "SENSEX", "Nifty LMC250", "Nifty Smallcap250"}
 
 # "Everything's hot" / capitulation master flags: both sentiment gauges + smallcap-vs-200DMA stretch.
 RISK_ON  = {"cnn": 80, "mmi": 75, "smallcap_d200": 0.15}
@@ -267,6 +275,21 @@ def yf_stats(symbol):
             "d200": (sum(closes[-200:]) / min(200, n) if n >= 100 else None),
             "peak": max(w), "trough": min(w), "lastclose": closes[-1],
             "ref5": (closes[-6] if n >= 6 else None)}
+
+def finnhub_quote(symbol):
+    """Real-time US quote via Finnhub /quote (free, IEX). Returns (live, prev) or (None, None) so the
+    caller can fall back to yfinance. c=current price, pc=previous close; c==0 => no data."""
+    if not FINNHUB_TOKEN:
+        return None, None
+    try:
+        d = SESSION.get("https://finnhub.io/api/v1/quote",
+                        params={"symbol": symbol, "token": FINNHUB_TOKEN}, timeout=15).json()
+        c, pc = d.get("c"), d.get("pc")
+        if c and pc:
+            return float(c), float(pc)
+    except Exception as ex:
+        print("   [finnhub] %s quote fail: %s" % (symbol, ex))
+    return None, None
 
 def yf_live(symbol):
     import yfinance as yf
@@ -589,6 +612,22 @@ def daily_move_alert(name, daily, thr, side, tier, dstate, today):
     dstate[name] = {"date": today, "side": mv}
     return True
 
+def info_move_alert(name, daily, dstate, today):
+    """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
+    if daily is None:
+        return False
+    if daily <= -INFO_DOWN:
+        mv = "down"
+    elif daily >= INFO_UP:
+        mv = "up"
+    else:
+        return False
+    rec = dstate.get(name, {})
+    if rec.get("date") == today and rec.get("side") == mv:
+        return False
+    dstate[name] = {"date": today, "side": mv}
+    return True
+
 def _late_big(daily):
     """Overnight: asymmetric threshold — +5% up (FYI) / -3% down (actionable)."""
     return daily >= LATE_UP or daily <= -LATE_DOWN
@@ -671,7 +710,12 @@ def fetch_one(c, group_is_us, cache):
                     cc = st                         # usable but not cached (no 200DMA yet)
             if cc is None:
                 return None, c.get("eod", False), is_us
-            live, prev = yf_live(sym)               # the only intraday call
+            live = prev = None
+            fhsym = c.get("finnhub")
+            if fhsym:                               # real-time (Finnhub/IEX) when a key is set
+                live, prev = finnhub_quote(fhsym)
+            if live is None:                        # no key / failure -> yfinance (~15-min delayed)
+                live, prev = yf_live(sym)
             return metrics_yf(cc, live, prev), c.get("eod", False), is_us
         if c["src"] == "mf":
             navs, name, code = mf_closes(c)
@@ -835,6 +879,24 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                and _late_big(r.m["daily"])
                and big_move(r.name, r.m["daily"], state, etd)]
 
+    # FYI / awareness tier: gentle pings for INFO_NAMES that moved past the (asymmetric) info band
+    # but aren't already going out as actionable. Self-caps ~11pm; once per day per side.
+    info = []
+    if now_ist().time() <= INFO_CUTOFF:
+        actionable = {r.name for r in fired}
+        if scope == "us":
+            actionable |= {r.name for r in (down_moves + big)}
+        istate = state.setdefault("_info", {})
+        for r in rows:
+            if r.name not in INFO_NAMES or r.name in actionable:
+                continue
+            if snapshot and r.is_us:        # premarket QQQ in the snapshot -> leave to hourly US
+                continue
+            if not (r.m and not r.eod and r.m["daily"] is not None):
+                continue
+            if info_move_alert(r.name, r.m["daily"], istate, today_str()):
+                info.append(r)
+
     if snapshot:   # record the intraday anchor (1:59 cron) for the MF-cutoff re-runs (2:41 / 2:54)
         state["_anchor"] = {"date": today_str(), "time": now_ist().strftime("%-I:%M%p"),
                             "px": {r.name: r.m["px"] for r in rows
@@ -857,7 +919,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                         for r in rows)
         send_snap = in_window and (bool(force_snapshot) or bool(fired) or risk_on or risk_off
                                    or bool(missing) or bool(cross_notes) or notable or bool(wk_movers)
-                                   or (standing and due))
+                                   or bool(info) or (standing and due))
         if send_snap:
             state["_last_snap"] = today_str()
     save_state(state)   # after all state mutations: step_state, sentiment_transition, big_move, anchor
@@ -872,11 +934,11 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if not send_snap:
             print("Snapshot silent (nothing fresh / out of window)."); _log(rows); return
     elif phase == "late":
-        if not big and not missing:
-            print("Late US — no >=3%% move."); _log(rows); return
+        if not big and not info and not missing:
+            print("Late US — nothing to report."); _log(rows); return
     else:
         moves = dmoved if scope == "india" else down_moves   # india books on up-moves too
-        if not fired and not moves and not strans and not missing:
+        if not fired and not moves and not info and not strans and not missing:
             print("No new signals."); _log(rows); return
 
     out = []
@@ -939,20 +1001,27 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if missing:
             out.append("\n⚠️ couldn't fetch: %s — %s" % (", ".join(missing), CRITICAL_HINT))
     elif phase == "late":
-        out.append("⚠️ <b>US — BIG MOVE</b> (overnight) — %s" % stamp())
-        out += [_dmove(r) for r in big]
+        if big:
+            out.append("⚠️ <b>US — BIG MOVE</b> (overnight) — %s" % stamp())
+            out += [_dmove(r) for r in big]
+        if info:
+            out.append("ℹ️ <b>US — FYI</b> — %s" % stamp())
+            out += [_info_line(r) for r in info]
         if missing:
             out.append("⚠️ couldn't fetch: %s — %s" % (", ".join(missing), CRITICAL_HINT))
     else:
         if scope == "india":
             out.append("💰 <b>INDIA — profit-booking watch</b> — %s" % stamp())
-        else:
+        elif fired or down_moves:
             out.append("⚠️ <b>US TECH</b> — %s" % stamp())
+        else:
+            out.append("ℹ️ <b>US — FYI</b> — %s" % stamp())
         for n in strans: out.append("🔔 " + n)
         fired_names = {r.name for r in fired}
         out += [_reason(r) for r in fired]
         moves = dmoved if scope == "india" else down_moves
         out += [_dmove(r) for r in moves if r.name not in fired_names]
+        out += [_info_line(r) for r in info if r.name not in fired_names]
         if missing:
             out.append("⚠️ couldn't fetch: %s — %s" % (", ".join(missing), CRITICAL_HINT))
 
@@ -976,6 +1045,11 @@ def _reason(r):
 def _dmove(r):
     m = r.m
     return "%s %s %s today" % ("🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
+
+def _info_line(r):
+    m = r.m
+    return "ℹ️ %s %s %s today — FYI, no action" % (
+        "🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
 
 def _india_cutoff(rows, state, mode):
     """MF-cutoff re-runs. Compares live India values to the anchor snapshot and alerts only on
@@ -1087,6 +1161,39 @@ def main(scope, force_snapshot=False, cutoff_mode=None):
         raise
 
 
+POLL_TRIGGERS = {"/status", "status", "hi", "digest", "market", "snapshot", "ping"}
+
+def poll_telegram():
+    """Cron-driven inbound poll (no webhook/daemon): if the configured chat sent a trigger word
+    since the last poll, fire a full digest. The offset is persisted BEFORE sending so a crash can't
+    loop-spam, and only the configured CHAT_ID is honoured."""
+    if not TELEGRAM_TOKEN:
+        sys.exit("No TELEGRAM_TOKEN set.")
+    state = load_state()
+    offset = state.get("tg_offset", 0)
+    try:
+        d = SESSION.get("https://api.telegram.org/bot%s/getUpdates" % TELEGRAM_TOKEN,
+                        params={"offset": offset + 1, "timeout": 0}, timeout=20).json()
+        updates = d.get("result", [])
+    except Exception as ex:
+        print("   [poll] getUpdates fail: %s" % ex); return
+    want, trigger = str(CHAT_ID), False
+    for u in updates:
+        offset = max(offset, u.get("update_id", offset))
+        msg = u.get("message") or u.get("edited_message") or {}
+        chat = str((msg.get("chat") or {}).get("id", ""))
+        text = (msg.get("text") or "").strip().lower()
+        word = text.split("@")[0].split()[0] if text else ""
+        if want and chat == want and word in POLL_TRIGGERS:
+            trigger = True
+    state["tg_offset"] = offset           # persist BEFORE sending (crash-safe)
+    save_state(state)
+    if trigger:
+        print("poll: trigger -> digest."); main("all", force_snapshot=True)
+    else:
+        print("poll: %d update(s), no trigger." % len(updates))
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
     if "--test" in args:
@@ -1117,6 +1224,8 @@ if __name__ == "__main__":
         print("Heartbeat sent.")
     elif "--calibrate" in args:
         calibrate()
+    elif "--poll" in args:
+        poll_telegram()
     elif "--digest" in args:
         main("all", force_snapshot=True)
     else:
