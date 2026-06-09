@@ -61,7 +61,7 @@ Row = namedtuple("Row", "glabel is_us snap name m side tier fire dmv crit eod nu
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")      # required — Telegram bot token from @BotFather
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID")    # required — target chat/group id (groups are negative)
-FINNHUB_TOKEN  = os.environ.get("FINNHUB_TOKEN", "")   # optional — real-time US quote (free, IEX); else yfinance
+FINNHUB_TOKEN  = os.environ.get("FINNHUB_TOKEN", "")    # optional: real-time US quote (Finnhub /quote, free IEX)
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_state.json")
 DIGEST_DATES = []
 
@@ -135,11 +135,12 @@ SELL_REARM, SELL_REARM_WIDE = 0.08, 0.12
 DAILY_MOVE, DAILY_MOVE_WIDE = 0.016, 0.025
 # Overnight (after the local market close): wake only for a big single-day move, asymmetric -- a
 # downside shock is the actionable one; an upside rip needs to be bigger before it is worth a ping.
-LATE_DOWN = 0.037   # overnight: -3.7% or worse pings (actionable)
-LATE_UP   = 0.053   # overnight: +5.3% or more pings
+LATE_DOWN = 0.04
+LATE_UP   = 0.06
 
-# FYI / awareness tier — a gentle "the market moved" notice (no implied trade). Asymmetric (a drop
-# nags sooner than a rip), once/day/side, never double-fires with actionable alerts, self-caps ~11pm.
+# FYI / awareness tier -- a gentle "the market moved" notice that kills FOMO without implying a
+# trade. Asymmetric (a drop nags sooner than a rip), once/day/side, never double-fires with an
+# actionable alert, self-caps ~11pm IST so it does not run deep into the overnight session.
 INFO_DOWN   = 0.020
 INFO_UP     = 0.025
 INFO_CUTOFF = dt.time(23, 5)
@@ -277,8 +278,8 @@ def yf_stats(symbol):
             "ref5": (closes[-6] if n >= 6 else None)}
 
 def finnhub_quote(symbol):
-    """Real-time US quote via Finnhub /quote (free, IEX). Returns (live, prev) or (None, None) so the
-    caller can fall back to yfinance. c=current price, pc=previous close; c==0 => no data."""
+    """Real-time US quote via Finnhub /quote (free, IEX). Returns (live, prev) or (None, None) so
+    the caller can fall back to yfinance. c=current price, pc=previous close; c==0 => no data."""
     if not FINNHUB_TOKEN:
         return None, None
     try:
@@ -612,22 +613,6 @@ def daily_move_alert(name, daily, thr, side, tier, dstate, today):
     dstate[name] = {"date": today, "side": mv}
     return True
 
-def info_move_alert(name, daily, dstate, today):
-    """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
-    if daily is None:
-        return False
-    if daily <= -INFO_DOWN:
-        mv = "down"
-    elif daily >= INFO_UP:
-        mv = "up"
-    else:
-        return False
-    rec = dstate.get(name, {})
-    if rec.get("date") == today and rec.get("side") == mv:
-        return False
-    dstate[name] = {"date": today, "side": mv}
-    return True
-
 def _late_big(daily):
     """Overnight: asymmetric threshold — +5% up (FYI) / -3% down (actionable)."""
     return daily >= LATE_UP or daily <= -LATE_DOWN
@@ -880,7 +865,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                and big_move(r.name, r.m["daily"], state, etd)]
 
     # FYI / awareness tier: gentle pings for INFO_NAMES that moved past the (asymmetric) info band
-    # but aren't already going out as actionable. Self-caps ~11pm; once per day per side.
+    # but are not already going out as actionable. Self-caps ~11pm IST; once per day per side.
     info = []
     if now_ist().time() <= INFO_CUTOFF:
         actionable = {r.name for r in fired}
@@ -890,7 +875,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         for r in rows:
             if r.name not in INFO_NAMES or r.name in actionable:
                 continue
-            if snapshot and r.is_us:        # premarket QQQ in the snapshot -> leave to hourly US
+            if snapshot and r.is_us:        # premarket QQQ in the snapshot -> leave to the hourly US run
                 continue
             if not (r.m and not r.eod and r.m["daily"] is not None):
                 continue
@@ -935,7 +920,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
             print("Snapshot silent (nothing fresh / out of window)."); _log(rows); return
     elif phase == "late":
         if not big and not info and not missing:
-            print("Late US — nothing to report."); _log(rows); return
+            print("Late US — no >=3%% move."); _log(rows); return
     else:
         moves = dmoved if scope == "india" else down_moves   # india books on up-moves too
         if not fired and not moves and not info and not strans and not missing:
@@ -1042,14 +1027,30 @@ def _reason(r):
             short(name), pct(m["drawdown"]), pct(m["dist200"]))
     return "💰 %s  trim — %s vs %s" % (short(name), pct(ref), lbl)
 
-def _dmove(r):
-    m = r.m
-    return "%s %s %s today" % ("🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
+def info_move_alert(name, daily, dstate, today):
+    """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
+    if daily is None:
+        return False
+    if daily <= -INFO_DOWN:
+        mv = "down"
+    elif daily >= INFO_UP:
+        mv = "up"
+    else:
+        return False
+    rec = dstate.get(name, {})
+    if rec.get("date") == today and rec.get("side") == mv:
+        return False
+    dstate[name] = {"date": today, "side": mv}
+    return True
 
 def _info_line(r):
     m = r.m
     return "ℹ️ %s %s %s today — FYI, no action" % (
         "🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
+
+def _dmove(r):
+    m = r.m
+    return "%s %s %s today" % ("🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
 
 def _india_cutoff(rows, state, mode):
     """MF-cutoff re-runs. Compares live India values to the anchor snapshot and alerts only on
@@ -1161,14 +1162,18 @@ def main(scope, force_snapshot=False, cutoff_mode=None):
         raise
 
 
-POLL_TRIGGERS = {"/status", "status", "hi", "digest", "market", "snapshot", "ping"}
+# ---- inbound poll (bidirectional "/status" digest) -----------------------------
+# On-demand pull: text the bot/group a trigger word and get the full snapshot back. A cron runs
+# this every minute (no webhook/daemon needed) — it reads getUpdates, and if the configured chat
+# sent a trigger since the last poll, fires a digest. tg_offset is persisted BEFORE the send so a
+# crash can't loop-spam, and only the configured CHAT_ID is honoured (everyone else is ignored).
+POLL_TRIGGERS = {"/status", "status", "/digest", "digest", "/market", "market",
+                 "snapshot", "ping", "hi"}
+POLL_HELP = {"/help", "help", "/start"}
 
 def poll_telegram():
-    """Cron-driven inbound poll (no webhook/daemon): if the configured chat sent a trigger word
-    since the last poll, fire a full digest. The offset is persisted BEFORE sending so a crash can't
-    loop-spam, and only the configured CHAT_ID is honoured."""
-    if not TELEGRAM_TOKEN:
-        sys.exit("No TELEGRAM_TOKEN set.")
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        sys.exit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID (see .env.example).")
     state = load_state()
     offset = state.get("tg_offset", 0)
     try:
@@ -1177,19 +1182,27 @@ def poll_telegram():
         updates = d.get("result", [])
     except Exception as ex:
         print("   [poll] getUpdates fail: %s" % ex); return
-    want, trigger = str(CHAT_ID), False
+    want, trigger, helped = str(CHAT_ID), False, False
     for u in updates:
         offset = max(offset, u.get("update_id", offset))
         msg = u.get("message") or u.get("edited_message") or {}
         chat = str((msg.get("chat") or {}).get("id", ""))
         text = (msg.get("text") or "").strip().lower()
-        word = text.split("@")[0].split()[0] if text else ""
-        if want and chat == want and word in POLL_TRIGGERS:
+        word = text.split("@")[0].split()[0] if text else ""   # strip @botname in groups
+        if not (want and chat == want):
+            continue
+        if word in POLL_TRIGGERS:
             trigger = True
-    state["tg_offset"] = offset           # persist BEFORE sending (crash-safe)
+        elif word in POLL_HELP:
+            helped = True
+    state["tg_offset"] = offset           # persist BEFORE sending (crash-safe, no re-trigger)
     save_state(state)
     if trigger:
         print("poll: trigger -> digest."); main("all", force_snapshot=True)
+    elif helped:
+        print("poll: help.")
+        send_telegram("\U0001F916 <b>market_alerts</b> — text <code>status</code> for the live "
+                      "snapshot. Otherwise I stay silent unless a market hits an extreme.")
     else:
         print("poll: %d update(s), no trigger." % len(updates))
 

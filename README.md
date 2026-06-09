@@ -53,6 +53,9 @@ The fill-bar shows position in the 52-week range (`▰` filled = near the high).
   markets with a daily mutual-fund NAV cutoff (alert only on *fresh* movement vs the day's anchor).
 - **An FYI / awareness tier** — a gentle, asymmetric “the market moved” ping (no implied
   trade), so a notable day registers without nagging like an actionable alert.
+- **Bidirectional, on-demand pull** — text the bot/group `status` (or `hi`, `digest`, …) and it
+  replies with the live snapshot. A once-a-minute `--poll` cron reads `getUpdates` (no webhook or
+  long-running daemon), and persists its update offset *before* replying so a crash can't loop-spam.
 - **Sentiment & trend overlays** — RISK-ON/RISK-OFF banners (CNN Fear & Greed + India MMI), a
   golden/death cross detector, and a "Mood index" with fear/greed fill-bars and trend arrows.
 - **Production hygiene** — atomic, crash-safe JSON state; pooled HTTP connections; once-a-day caching
@@ -89,11 +92,20 @@ python market_alerts.py --calibrate   # dry-run: print current DMA distances (no
 Create a Telegram bot with [@BotFather](https://t.me/BotFather) for the token; add the bot to your
 chat/group and use that chat id (group ids are negative).
 
+## On-demand status (bidirectional)
+
+Most of the time the bot is silent. When you *do* want a read, message the chat one of
+`status` / `/status` / `hi` / `digest` / `market` / `snapshot` / `ping` and it replies with the full
+snapshot; `help` returns a one-line usage hint. This is driven by a `--poll` cron (below) rather than
+a webhook, so there is nothing long-running to host: each run reads new Telegram updates, and only the
+configured `TELEGRAM_CHAT_ID` is honoured (messages from anyone else are ignored).
+
 ## Tests
 
 Unit tests cover the core signal logic — tier classification, the escalate-only state machine, the
-range/mood fill-bars, the golden/death cross, and the multi-day trigger. They need no network or
-credentials (`market_alerts.py` imports cleanly; `yfinance` is loaded lazily, only at fetch time):
+range/mood fill-bars, the golden/death cross, the multi-day trigger, and the poll/FYI helpers. They
+need no network or credentials (`market_alerts.py` imports cleanly; `yfinance` is loaded lazily, only
+at fetch time):
 
 ```bash
 python -m unittest discover -s tests -v
@@ -117,11 +129,13 @@ names), `range_days` (peak lookback), and `critical` (fetch-failure alert). Thre
 ## Deployment
 
 It is a plain script — schedule it with `cron`. Example (IST), sending a gated full snapshot during
-the Indian session and an alert-only US run hourly:
+the Indian session, an alert-only US run hourly, and a once-a-minute inbound poll for the on-demand
+`/status` reply:
 
 ```cron
 59 13 * * 1-5  set -a; . $HOME/.env; set +a; cd ~/market-extremes-alerter && python3 market_alerts.py --scope all >> run.log 2>&1
 30 13-22 * * 1-5  set -a; . $HOME/.env; set +a; cd ~/market-extremes-alerter && python3 market_alerts.py --scope us >> run.log 2>&1
+* * * * *  set -a; . $HOME/.env; set +a; cd ~/market-extremes-alerter && python3 market_alerts.py --poll >> run.log 2>&1
 ```
 
 For markets with a mutual-fund NAV cutoff, add the optional `--recheck` / `--cutoff` re-runs a few
