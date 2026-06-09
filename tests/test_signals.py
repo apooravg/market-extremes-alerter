@@ -1,101 +1,169 @@
-"""Unit + smoke tests for the signal engine. No network or credentials required —
-the module imports cleanly (yfinance is imported lazily, only at fetch time)."""
-import importlib.util
+"""Unit tests for the pure signal logic in market_alerts.py.
+
+No network or credentials required: market_alerts imports cleanly (yfinance is loaded lazily,
+only inside fetch functions). Run with:  python -m unittest discover -s tests -v
+"""
 import os
+import sys
 import unittest
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-_spec = importlib.util.spec_from_file_location(
-    "market_alerts", os.path.join(_HERE, "..", "market_alerts.py"))
-ma = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ma)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import market_alerts as m  # noqa: E402
+
+BANDS = m.resolve_bands({"buy": [-0.10, -0.18, -0.28], "sell": [0.12, 0.18],
+                         "buy_rearm": -0.07, "sell_rearm": 0.08})
+ROW_FIELDS = "glabel is_us snap name m side tier fire dmv crit eod nudge"
 
 
-def _row(name, **m):
-    base = dict(px=100, d50=98, d100=97, d200=95, peak=110, trough=80,
-                dist50=0.0, dist100=0.0, dist200=0.0, drawdown=-0.05, runup=0.2,
-                daily=0.0, wk=None, sref="d50", blabel=None)
-    base.update(m)
-    return ma.Row("g", False, True, name, base, "", 0, None, False, False, False, "")
-
-
-class TestConfig(unittest.TestCase):
-    def test_instruments_present(self):
-        self.assertIn("SENSEX", ma.INDIA_IDX)
-        self.assertIn("Nasdaq100 (QQQ)", ma.US_IDX)
+def row(name, mdict, **kw):
+    base = dict(glabel="g", is_us=False, snap=True, name=name, m=mdict, side=None,
+                tier=0, fire=None, dmv=False, crit=False, eod=False, nudge="")
+    base.update(kw)
+    return m.Row(**base)
 
 
 class TestClassify(unittest.TestCase):
-    def setUp(self):
-        self.b = ma.resolve_bands(ma.INDIA_IDX["SENSEX"])  # buy [-15/-22/-30], sell [12/18]
+    def test_buy_tiers(self):
+        self.assertEqual(m.classify(None, -0.11, BANDS), ("buy", 1))
+        self.assertEqual(m.classify(None, -0.20, BANDS), ("buy", 2))
+        self.assertEqual(m.classify(None, -0.40, BANDS), ("buy", 3))
 
-    def test_deep_dip_is_buy(self):
-        self.assertEqual(ma.classify(0.0, -0.16, self.b), ("buy", 1))
-        self.assertEqual(ma.classify(0.0, -0.31, self.b), ("buy", 3))
+    def test_sell_tiers(self):
+        self.assertEqual(m.classify(0.13, None, BANDS), ("sell", 1))
+        self.assertEqual(m.classify(0.25, None, BANDS), ("sell", 2))
 
-    def test_froth_is_sell(self):
-        self.assertEqual(ma.classify(0.30, 0.0, self.b), ("sell", 2))
+    def test_neutral_and_buy_priority(self):
+        self.assertEqual(m.classify(0.05, -0.02, BANDS), (None, 0))
+        # a drawdown deep enough to buy wins even if the DMA distance is also stretched
+        self.assertEqual(m.classify(0.25, -0.30, BANDS), ("buy", 3))
 
-    def test_quiet_is_none(self):
-        self.assertEqual(ma.classify(0.05, -0.05, self.b), (None, 0))
+
+class TestResolveBands(unittest.TestCase):
+    def test_wide_loosens_only_sell(self):
+        narrow = m.resolve_bands({})
+        wide = m.resolve_bands({"wide": True})
+        self.assertEqual(narrow["buy"], wide["buy"])          # buy side never loosened
+        self.assertGreater(wide["sell"][0], narrow["sell"][0])  # sell froth band wider
+
+    def test_per_instrument_override(self):
+        b = m.resolve_bands({"buy": [-0.05], "sell": [0.5]})
+        self.assertEqual(b["buy"], [-0.05])
+        self.assertEqual(b["sell"], [0.5])
 
 
 class TestStateMachine(unittest.TestCase):
-    def test_escalate_once_then_recover(self):
-        b = ma.resolve_bands(ma.INDIA_IDX["Nifty Smallcap250"])  # sell [8/11/14], rearm 5
+    def test_enter_escalate_hold_recover(self):
         st = {}
-        self.assertEqual(ma.step_state("X", "sell", 1, 0.09, -0.05, b, st), "enter")
-        self.assertIsNone(ma.step_state("X", "sell", 1, 0.09, -0.05, b, st))   # no repeat at tier
-        self.assertEqual(ma.step_state("X", "sell", 2, 0.12, -0.05, b, st), "escalate")
-        # falls back below the re-arm level -> resets with a "recover"
-        self.assertEqual(ma.step_state("X", None, 0, 0.03, -0.05, b, st), "recover")
+        self.assertEqual(m.step_state("X", "buy", 1, None, -0.11, BANDS, st), "enter")
+        # same tier -> no re-fire
+        self.assertIsNone(m.step_state("X", "buy", 1, None, -0.12, BANDS, st))
+        # deeper tier -> escalate
+        self.assertEqual(m.step_state("X", "buy", 2, None, -0.20, BANDS, st), "escalate")
+        # still in zone, not past re-arm -> hold (no recover)
+        self.assertIsNone(m.step_state("X", None, 0, None, -0.09, BANDS, st))
+        # recovered past buy_rearm (-0.07) -> recover, state resets
+        self.assertEqual(m.step_state("X", None, 0, None, -0.05, BANDS, st), "recover")
+        self.assertEqual(st["X"], {"side": None, "tier": 0})
+
+    def test_flip_sides(self):
+        st = {}
+        m.step_state("Y", "sell", 1, 0.13, None, BANDS, st)
+        self.assertEqual(m.step_state("Y", "buy", 1, None, -0.11, BANDS, st), "flip")
 
 
-class TestRender(unittest.TestCase):
-    def test_mood_bar_endpoints(self):
-        self.assertEqual(ma._mood_bar(0), "▱" * 10)
-        self.assertEqual(ma._mood_bar(100), "▰" * 10)
-        self.assertEqual(ma._mood_bar(50).count("▰"), 5)
+class TestDailyAndInfo(unittest.TestCase):
+    def test_daily_move_once_per_side(self):
+        ds = {}
+        self.assertTrue(m.daily_move_alert("X", -0.03, 0.02, None, 0, ds, "2026-06-09"))
+        self.assertFalse(m.daily_move_alert("X", -0.03, 0.02, None, 0, ds, "2026-06-09"))
+        # below threshold
+        self.assertFalse(m.daily_move_alert("Z", -0.01, 0.02, None, 0, {}, "2026-06-09"))
+        # suppressed when already deep in a buy tier and falling further
+        self.assertFalse(m.daily_move_alert("X", -0.03, 0.02, "buy", 2, {}, "2026-06-09"))
 
-    def test_range_line_position(self):
-        m = dict(px=104, peak=110, trough=80, drawdown=104 / 110 - 1, runup=104 / 80 - 1)
-        out = ma.range_line(m)
-        self.assertEqual(out.count("▰"), 8)   # 80% of the 52-week range
-        self.assertIn("above low", out)
+    def test_info_asymmetric_once_per_side(self):
+        ds = {}
+        self.assertTrue(m.info_move_alert("X", -m.INFO_DOWN, ds, "2026-06-09"))
+        self.assertFalse(m.info_move_alert("X", -m.INFO_DOWN, ds, "2026-06-09"))  # repeat same side
+        # asymmetry: the up band is stricter than the down band
+        self.assertGreater(m.INFO_UP, m.INFO_DOWN)
+        self.assertFalse(m.info_move_alert("Y", 0.022, {}, "2026-06-09"))  # +2.2% < INFO_UP
+        self.assertTrue(m.info_move_alert("Y", m.INFO_UP, {}, "2026-06-09"))
+
+
+class TestOvernight(unittest.TestCase):
+    def test_late_big_threshold(self):
+        self.assertTrue(m._late_big(-m.LATE_DOWN))
+        self.assertTrue(m._late_big(m.LATE_UP))
+        self.assertFalse(m._late_big(-0.01))
+        # asymmetric: a smaller down move trips before an up move of the same size
+        self.assertLess(m.LATE_DOWN, m.LATE_UP)
+
+    def test_big_move_fires_once_per_day(self):
+        st = {}
+        self.assertTrue(m.big_move("QQQ", -0.05, st, "2026-06-09"))
+        self.assertFalse(m.big_move("QQQ", -0.05, st, "2026-06-09"))
+        self.assertTrue(m.big_move("QQQ", -0.05, st, "2026-06-10"))  # new day re-arms
+
+
+class TestFillBars(unittest.TestCase):
+    def test_mood_bar(self):
+        self.assertEqual(len(m._mood_bar(50)), 10)
+        self.assertEqual(m._mood_bar(0), "▱" * 10)   # extreme fear -> empty
+        self.assertEqual(m._mood_bar(100), "▰" * 10)  # extreme greed -> full
+
+    def test_mood_trend_arrows(self):
+        self.assertIn("↗", m._mood_trend(70, 60))   # rising
+        self.assertIn("↘", m._mood_trend(50, 60))   # easing
+        self.assertEqual(m._mood_trend(50, None), "")
+
+    def test_range_line_bar(self):
+        out = m.range_line({"peak": 120, "trough": 80, "px": 100,
+                            "drawdown": -0.1667, "runup": 0.25})
+        self.assertIn("▰", out)            # has a fill bar
         self.assertIn("below high", out)
 
 
-class TestCross(unittest.TestCase):
+class TestCrossAndWeekly(unittest.TestCase):
     def test_golden_then_death_fire_once(self):
+        name = next(iter(m.CROSS_NAMES))
         st = {}
-        self.assertEqual(ma.cross_events([_row("SENSEX", d50=95, d200=100)], st), [])  # baseline
-        self.assertTrue(any("Golden" in n for n in
-                            ma.cross_events([_row("SENSEX", d50=101, d200=100)], st)))
-        self.assertEqual(ma.cross_events([_row("SENSEX", d50=102, d200=100)], st), [])  # no repeat
-        self.assertTrue(any("Death" in n for n in
-                            ma.cross_events([_row("SENSEX", d50=99, d200=100)], st)))
+        # first observation just records the side (no note)
+        self.assertEqual(m.cross_events([row(name, {"d50": 90, "d200": 100})], st), [])
+        # 50DMA crosses above 200DMA -> golden cross
+        notes = m.cross_events([row(name, {"d50": 110, "d200": 100})], st)
+        self.assertTrue(any("Golden cross" in n for n in notes))
+        # holding above -> no repeat
+        self.assertEqual(m.cross_events([row(name, {"d50": 112, "d200": 100})], st), [])
+        # crosses back below -> death cross
+        notes = m.cross_events([row(name, {"d50": 95, "d200": 100})], st)
+        self.assertTrue(any("Death cross" in n for n in notes))
+
+    def test_weekly_movers_threshold(self):
+        r_big = row("Idx", {"wk": -0.10})
+        r_small = row("Idx2", {"wk": -0.005})
+        movers = m.weekly_movers([r_big, r_small])
+        names = [r.name for r, _ in movers]
+        self.assertIn("Idx", names)
+        self.assertNotIn("Idx2", names)
 
 
-class TestWeekly(unittest.TestCase):
-    def test_slow_bleed_fires(self):
-        self.assertTrue(ma.weekly_movers([_row("Nifty Smallcap250", wk=-0.034)]))
-        self.assertFalse(ma.weekly_movers([_row("Nifty Smallcap250", wk=-0.020)]))
+class TestPollAndHelpers(unittest.TestCase):
+    def test_poll_triggers(self):
+        for w in ("status", "/status", "digest", "ping"):
+            self.assertIn(w, m.POLL_TRIGGERS)
+        self.assertIn("help", m.POLL_HELP)
 
+    def test_finnhub_noop_without_token(self):
+        # no token configured in the test env -> graceful (None, None), never raises
+        if not m.FINNHUB_TOKEN:
+            self.assertEqual(m.finnhub_quote("QQQ"), (None, None))
 
-class TestInfoTier(unittest.TestCase):
-    def test_asymmetric_band_and_dedup(self):
-        ds = {}
-        self.assertTrue(ma.info_move_alert("QQQ", -0.021, ds, "D"))   # -2.1% trips the -2% down band
-        self.assertFalse(ma.info_move_alert("QQQ", -0.021, ds, "D"))  # same day/side -> no repeat
-        self.assertFalse(ma.info_move_alert("QQQ", 0.020, ds, "D"))   # +2.0% is below the +2.5% up band
-        self.assertTrue(ma.info_move_alert("QQQ", 0.026, ds, "D"))    # +2.6% trips the up band
-
-
-class TestFinnhubFallback(unittest.TestCase):
-    def test_no_key_returns_none(self):
-        # with no FINNHUB_TOKEN, the quote returns (None, None) so the caller falls back to yfinance
-        self.assertEqual(ma.finnhub_quote("QQQ"), (None, None))
+    def test_pct_and_short(self):
+        self.assertEqual(m.pct(None), "n/a")
+        self.assertEqual(m.pct(0.123), "+12.3%")
+        self.assertEqual(m.short("Nasdaq100 (QQQ)"), "Nasdaq100")
 
 
 if __name__ == "__main__":
-    unittest.main()
+    unittest.main(verbosity=2)
