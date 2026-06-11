@@ -47,6 +47,7 @@ USAGE
 import json
 import os
 import sys
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -163,8 +164,8 @@ CUTOFF_BUY_DROP = 0.009
 # or a notable same-day / multi-day move occurs. Otherwise it records state silently.
 REMIND_DAYS = 7
 # Same-day move trigger on a live index -- asymmetric (a fall is the more actionable one).
-SNAP_DAILY_DOWN = 0.012
-SNAP_DAILY_UP   = 0.017
+SNAP_DAILY_DOWN = 0.020
+SNAP_DAILY_UP   = 0.025
 # Multi-day (~5 session) move trigger -- catches a slow bleed / rally that no single day tripped.
 WEEK_DOWN = 0.030
 WEEK_UP   = 0.045
@@ -218,11 +219,24 @@ def send_telegram(text):
         sys.exit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID (see .env.example).")
     if len(text) > 4096:                 # Telegram hard cap -> degrade instead of 400-failing
         text = text[:4090] + "\n\u2026"
-    r = SESSION.post(
-        "https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN,
-        json={"chat_id": resolve_chat_id(), "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": True}, timeout=20)
-    r.raise_for_status()
+    payload = {"chat_id": resolve_chat_id(), "text": text, "parse_mode": "HTML",
+               "disable_web_page_preview": True}
+    last = None
+    for attempt in range(3):   # a transient Telegram failure must not eat an alert: retry, then raise
+        try:
+            r = SESSION.post("https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN,
+                             json=payload, timeout=20)
+            r.raise_for_status()
+            return
+        except requests.RequestException as ex:
+            sc = getattr(getattr(ex, "response", None), "status_code", None)
+            if sc is not None and 400 <= sc < 500:
+                raise          # config/formatting error (bad HTML, bad chat id) - retrying won't help
+            last = ex
+            print("   [tg] send fail (try %d): %s" % (attempt + 1, ex))
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+    raise last
 
 def notify_failure(text):
     try:
@@ -312,21 +326,40 @@ def yf_live(symbol):
             pass
     return (float(live) if live else None, float(prev) if prev else None)
 
+STALE_NAV_DAYS = 7   # a fund NAV older than this = feed frozen / scheme merged -> surface it
+_STALE_NAVS = []     # collected per run (module-global: one run per process)
+
+def _note_stale(name, last_date):
+    """Record a stale-NAV fund so the snapshot can warn (weekly nag per fund, see run())."""
+    if not last_date:
+        return
+    try:
+        d = dt.datetime.strptime(last_date, "%d-%m-%Y").date()
+    except ValueError:
+        return
+    if (now_ist().date() - d).days > STALE_NAV_DAYS:
+        s = "%s (last NAV %s)" % (name, last_date)
+        if s not in _STALE_NAVS:
+            _STALE_NAVS.append(s)
+
 def _navs_for_code(code):
     h = SESSION.get("https://api.mfapi.in/mf/%s" % code, headers=UA, timeout=20).json()
-    navs = []
-    for x in h.get("data", []):
+    navs, last_date = [], None
+    for x in h.get("data", []):          # mfapi returns newest-first
         try:
             navs.append(float(x["nav"]))
+            if last_date is None:
+                last_date = x.get("date")        # newest NAV's date (dd-mm-YYYY)
         except (ValueError, KeyError):
             pass
     navs.reverse()  # oldest-first
-    return navs, h.get("meta", {}).get("scheme_name", "")
+    return navs, h.get("meta", {}).get("scheme_name", ""), last_date
 
 def mf_closes(c):
     """Resolve a fund robustly. Returns (navs_oldest_first, resolved_name, code)."""
     if c.get("code"):
-        navs, name = _navs_for_code(c["code"])
+        navs, name, last_date = _navs_for_code(c["code"])
+        _note_stale(name or str(c["code"]), last_date)
         return navs, name, c["code"]
     must = [t.lower() for t in c.get("must", [])]
     avoid = [t.lower() for t in c.get("avoid", [])]
@@ -347,7 +380,8 @@ def mf_closes(c):
     best = max(cands, key=score, default=None)
     if not best:
         return [], None, None
-    navs, _ = _navs_for_code(best["schemeCode"])
+    navs, _, last_date = _navs_for_code(best["schemeCode"])
+    _note_stale(best["schemeName"], last_date)
     return navs, best["schemeName"], best["schemeCode"]
 
 
@@ -504,7 +538,8 @@ def metrics(closes, live=None, prev=None, rng=252):
 def metrics_yf(stats, live, prev):
     """Build metrics from cached daily stats + a fresh live/prev (the only intraday-varying bits)."""
     px = live if live is not None else stats["lastclose"]
-    ref = prev if prev else stats["lastclose"]
+    # both live+prev missing -> px IS lastclose; a fake "0.0% today" misleads -> daily n/a instead
+    ref = prev if prev else (stats["lastclose"] if live is not None else None)
     m = _metrics(stats.get("d50"), stats.get("d100"), stats["d200"], stats["peak"], stats["trough"], px, ref)
     m["wk"] = (px / stats["ref5"] - 1) if stats.get("ref5") else None
     return m
@@ -529,7 +564,7 @@ def nav_levels(navs, rng=252):
     return {"d50":  sum(navs[-50:]) / min(50, n) if n >= 20 else None,
             "d100": sum(navs[-100:]) / min(100, n) if n >= 50 else None,
             "d200": sum(navs[-200:]) / min(200, n) if n >= 100 else None,
-            "peak": max(window), "trough": min(window),
+            "peak": max(window), "trough": min(window), "allpeak": max(navs),
             "latest": navs[-1], "prev": navs[-2] if n >= 2 else navs[-1],
             "ref5": (navs[-6] if n >= 6 else None), "n": n}
 
@@ -547,6 +582,8 @@ def metrics_nse(levels, live, prev):
                  sc(levels.get("peak")), sc(levels.get("trough")), live, prev)
     ref5 = levels.get("ref5")
     m["wk"] = ((nav_latest / ref5) * (live / prev) - 1) if (ref5 and prev) else None
+    ap = levels.get("allpeak")
+    m["dd_ath"] = (live / (ap * k) - 1) if ap else None   # ATH context (the NAV history carries it)
     return m
 
 def resolve_bands(c):
@@ -670,7 +707,7 @@ def snap_block(r):
                   (("50DMA", "dist50"), ("200DMA", "dist200")) if m.get(k) is not None]
         if dparts:
             ctx = (ctx + "\n" if ctx else "") + " \u00b7 ".join(dparts)
-        if m.get("dd_ath") is not None:   # funds only (nse indices don't carry full history)
+        if m.get("dd_ath") is not None:   # funds + NSE hybrids (NAV history carries the ATH)
             dd = m.get("drawdown")
             if dd is not None and abs(m["dd_ath"] - dd) < 0.001:
                 ctx = ctx.replace("below high", "below all-time high")   # identical -> one line, ATH label
@@ -709,7 +746,7 @@ def fetch_one(c, group_is_us, cache):
             return metrics(navs, None, None, c.get("range_days", 252)), True, is_us
         if c["src"] == "nse":
             code = c["dma_code"]
-            ck = "navlv2_%s" % code   # v2 schema: includes d100
+            ck = "navlv3_%s" % code   # v3 schema: + allpeak (ATH context)
             cc = cache.get(ck)
             if not (cc and cc.get("date") == today_str() and cc.get("levels")):
                 navs, _, _ = mf_closes({"code": code})       # heavy NAV pull -> once per day
@@ -806,6 +843,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
     snapshot = force_snapshot or scope == "all"
     phase = us_phase() if (scope == "us" and not snapshot) else "day"
     cache = state.setdefault("_cache", {})
+    for k in [k for k in cache if k.startswith("navlv") and not k.startswith("navlv3_")]:
+        del cache[k]            # prune superseded nav-cache schema versions
     # Sentiment is only used in the snapshot and for day-phase transition pings — skip the two
     # network calls overnight.
     sent = fetch_sentiment() if (snapshot or (phase == "day" and not cutoff_mode)) else {"cnn": None, "mmi": None}
@@ -855,7 +894,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
     # Day hourly (alert-only): tier crossings buy AND sell + DOWN days. Up-days dropped (froth is
     # covered by sell tiers).
     down_moves = [r for r in dmoved if r.m and r.m["daily"] is not None and r.m["daily"] < 0]
-    # Late/overnight: ONLY a big single-day move (>=3%, either side) on live US instruments.
+    # Late/overnight: a big single-day move (LATE_DOWN/UP) on live US instruments. Fresh tier
+    # crossings are ALSO sent late (state advances either way; swallowing one = a lost alert).
     big = []
     if phase == "late":
         etd = now_et().date().isoformat()
@@ -889,6 +929,15 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
 
     # General snapshot send-gate: not a daily digest. Send only when something is fresh, or a
     # standing booking opportunity is due an occasional reminder. --digest (force) always sends.
+    # Stale-NAV warning (feed frozen / scheme merged): weekly nag per fund, snapshot-only.
+    stale = []
+    if snapshot and _STALE_NAVS:
+        warned = state.setdefault("_stale_warned", {})
+        for s in _STALE_NAVS:
+            nm = s.split(" (")[0]
+            if nm not in warned or _days_since(warned[nm]) >= REMIND_DAYS:
+                warned[nm] = today_str(); stale.append(s)
+
     risk_on, risk_off, risk_lines = _risk(rows, sent)
     cross_notes = cross_events(rows, state) if snapshot else []
     wk_movers   = weekly_movers(rows) if snapshot else []
@@ -904,7 +953,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                         for r in rows)
         send_snap = in_window and (bool(force_snapshot) or bool(fired) or risk_on or risk_off
                                    or bool(missing) or bool(cross_notes) or notable or bool(wk_movers)
-                                   or bool(info) or (standing and due))
+                                   or bool(info) or bool(stale) or (standing and due))
         if send_snap:
             state["_last_snap"] = today_str()
     save_state(state)   # after all state mutations: step_state, sentiment_transition, big_move, anchor
@@ -919,7 +968,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if not send_snap:
             print("Snapshot silent (nothing fresh / out of window)."); _log(rows); return
     elif phase == "late":
-        if not big and not info and not missing:
+        if not fired and not big and not info and not missing:
             print("Late US — no >=3%% move."); _log(rows); return
     else:
         moves = dmoved if scope == "india" else down_moves   # india books on up-moves too
@@ -978,6 +1027,9 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
             out.append("\n📌 <b>Fund alerts</b>")
             out += [_reason(r) for r in ff]
 
+        if stale:
+            out.append("\n⚠️ <b>stale NAV</b> (feed frozen?): %s" % ", ".join(stale))
+
         heads_news = fetch_headlines()
         if heads_news:
             out.append("")
@@ -986,6 +1038,9 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if missing:
             out.append("\n⚠️ couldn't fetch: %s — %s" % (", ".join(missing), CRITICAL_HINT))
     elif phase == "late":
+        if fired:   # tier crossings are rare + actionable -> never swallow them overnight
+            out.append("⚠️ <b>US TECH</b> — %s" % stamp())
+            out += [_reason(r) for r in fired]
         if big:
             out.append("⚠️ <b>US — BIG MOVE</b> (overnight) — %s" % stamp())
             out += [_dmove(r) for r in big]
@@ -1025,7 +1080,9 @@ def _reason(r):
             return "🟢 DEPLOY-T%d  %s  %s off 1y peak" % (tier, short(name), pct(m["drawdown"]))
         return "🔻 %s  %s off peak  (%s vs 200DMA)" % (
             short(name), pct(m["drawdown"]), pct(m["dist200"]))
-    return "💰 %s  trim — %s vs %s" % (short(name), pct(ref), lbl)
+    dd = m.get("drawdown")
+    ctx = ("  · %s off 1y peak" % pct(dd)) if dd is not None else ""
+    return "💰 %s  trim — %s vs %s%s" % (short(name), pct(ref), lbl, ctx)
 
 def info_move_alert(name, daily, dstate, today):
     """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
