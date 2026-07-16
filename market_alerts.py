@@ -46,8 +46,8 @@ USAGE
 """
 import json
 import os
-import sys
 import time
+import sys
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -62,7 +62,7 @@ Row = namedtuple("Row", "glabel is_us snap name m side tier fire dmv crit eod nu
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")      # required — Telegram bot token from @BotFather
 CHAT_ID        = os.environ.get("TELEGRAM_CHAT_ID")    # required — target chat/group id (groups are negative)
-FINNHUB_TOKEN  = os.environ.get("FINNHUB_TOKEN", "")    # optional: real-time US quote (Finnhub /quote, free IEX)
+FINNHUB_TOKEN  = os.environ.get("FINNHUB_TOKEN", "")   # optional — real-time US quote (free, IEX); else yfinance
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_state.json")
 DIGEST_DATES = []
 
@@ -95,8 +95,15 @@ INDIA_IDX = {
 }
 US_IDX = {
     # Broad US-tech barometer. Buy dips sensitive; froth-sell only at a genuine top (+22/+30 vs 200DMA).
+    # US tech is an active DEPLOY target (fresh capital on good dips): generic-sensitive buy ladder
+    # (-10/-18/-28 via BUY_DD) but labelled DEPLOY so a fire reads "put money in", not "dip noted".
     "Nasdaq100 (QQQ)":   {"src": "yf", "symbol": "QQQ", "finnhub": "QQQ", "wide": True, "critical": True,
+                          "buy_label": "DEPLOY",
                           "sell": [0.22, 0.30], "sell_rearm": 0.15},
+    # Example display-only row: price shown in the snapshot, never alerts (the index above carries
+    # the signal). Handy for an ETF you track mentally.
+    "US Tech (VGT)":     {"src": "yf", "symbol": "VGT", "finnhub": "VGT", "display_only": True,
+                          "is_us": True, "us_view": True},   # shown only in the on-demand `us` view
 }
 # Alert-only watch list (never shown in the snapshot; pings only on a tier cross). Empty by default.
 FUNDS = {}
@@ -109,10 +116,12 @@ FUNDS = {}
 HOLDINGS = {}
 
 SHORT = {"Nifty LMC250": "Nifty Large & Midcap 250", "Nifty Smallcap250": "Nifty Smallcap 250",
-         "Nasdaq100 (QQQ)": "Nasdaq100"}
+         "Nasdaq100 (QQQ)": "Nasdaq100", "US Tech (VGT)": "VGT"}
 # Snapshot layout: groups separated by a delimiter line.
 DISPLAY_GROUPS = [["SENSEX", "Nasdaq100 (QQQ)"],
                   ["Nifty LMC250", "Nifty Smallcap250"]]
+# On-demand `us` view layout (ETF roster).
+DISPLAY_GROUPS_US = [["Nasdaq100 (QQQ)", "US Tech (VGT)"]]
 DELIM = "\u2014" * 10
 # Levels where the absolute number is not meaningful (index points / proxy NAV) -> show % move only.
 NO_VALUE = {"Nasdaq100 (QQQ)", "Nifty LMC250", "Nifty Smallcap250"}
@@ -121,7 +130,7 @@ NO_VALUE = {"Nasdaq100 (QQQ)", "Nifty LMC250", "Nifty Smallcap250"}
 BOOK_NAMES = {"Nifty LMC250", "Nifty Smallcap250"}
 # Deploy-the-dip targets: staged BUY on a drawdown from the 1y peak, surfaced in the snapshot's
 # "Deploy signal" section.
-DEPLOY_NAMES = {"SENSEX", "Nifty LMC250", "Nifty Smallcap250"}
+DEPLOY_NAMES = {"SENSEX", "Nifty LMC250", "Nifty Smallcap250", "Nasdaq100 (QQQ)"}
 # Golden/Death cross watch (50DMA vs 200DMA) on the trend barometers. Fires once on the crossing.
 CROSS_NAMES = {"SENSEX", "Nasdaq100 (QQQ)", "Nifty LMC250", "Nifty Smallcap250"}
 
@@ -136,12 +145,11 @@ SELL_REARM, SELL_REARM_WIDE = 0.08, 0.12
 DAILY_MOVE, DAILY_MOVE_WIDE = 0.016, 0.025
 # Overnight (after the local market close): wake only for a big single-day move, asymmetric -- a
 # downside shock is the actionable one; an upside rip needs to be bigger before it is worth a ping.
-LATE_DOWN = 0.04
-LATE_UP   = 0.06
+LATE_DOWN = 0.037   # overnight: -3.7% or worse pings (actionable)
+LATE_UP   = 0.053   # overnight: +5.3% or more pings
 
-# FYI / awareness tier -- a gentle "the market moved" notice that kills FOMO without implying a
-# trade. Asymmetric (a drop nags sooner than a rip), once/day/side, never double-fires with an
-# actionable alert, self-caps ~11pm IST so it does not run deep into the overnight session.
+# FYI / awareness tier — a gentle "the market moved" notice (no implied trade). Asymmetric (a drop
+# nags sooner than a rip), once/day/side, never double-fires with actionable alerts, self-caps ~11pm.
 INFO_DOWN   = 0.020
 INFO_UP     = 0.025
 INFO_CUTOFF = dt.time(23, 5)
@@ -164,8 +172,8 @@ CUTOFF_BUY_DROP = 0.009
 # or a notable same-day / multi-day move occurs. Otherwise it records state silently.
 REMIND_DAYS = 7
 # Same-day move trigger on a live index -- asymmetric (a fall is the more actionable one).
-SNAP_DAILY_DOWN = 0.020
-SNAP_DAILY_UP   = 0.025
+SNAP_DAILY_DOWN = 0.012
+SNAP_DAILY_UP   = 0.017
 # Multi-day (~5 session) move trigger -- catches a slow bleed / rally that no single day tripped.
 WEEK_DOWN = 0.030
 WEEK_UP   = 0.045
@@ -219,24 +227,11 @@ def send_telegram(text):
         sys.exit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID (see .env.example).")
     if len(text) > 4096:                 # Telegram hard cap -> degrade instead of 400-failing
         text = text[:4090] + "\n\u2026"
-    payload = {"chat_id": resolve_chat_id(), "text": text, "parse_mode": "HTML",
-               "disable_web_page_preview": True}
-    last = None
-    for attempt in range(3):   # a transient Telegram failure must not eat an alert: retry, then raise
-        try:
-            r = SESSION.post("https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN,
-                             json=payload, timeout=20)
-            r.raise_for_status()
-            return
-        except requests.RequestException as ex:
-            sc = getattr(getattr(ex, "response", None), "status_code", None)
-            if sc is not None and 400 <= sc < 500:
-                raise          # config/formatting error (bad HTML, bad chat id) - retrying won't help
-            last = ex
-            print("   [tg] send fail (try %d): %s" % (attempt + 1, ex))
-            if attempt < 2:
-                time.sleep(3 * (attempt + 1))
-    raise last
+    r = SESSION.post(
+        "https://api.telegram.org/bot%s/sendMessage" % TELEGRAM_TOKEN,
+        json={"chat_id": resolve_chat_id(), "text": text, "parse_mode": "HTML",
+              "disable_web_page_preview": True}, timeout=20)
+    r.raise_for_status()
 
 def notify_failure(text):
     try:
@@ -292,8 +287,8 @@ def yf_stats(symbol):
             "ref5": (closes[-6] if n >= 6 else None)}
 
 def finnhub_quote(symbol):
-    """Real-time US quote via Finnhub /quote (free, IEX). Returns (live, prev) or (None, None) so
-    the caller can fall back to yfinance. c=current price, pc=previous close; c==0 => no data."""
+    """Real-time US quote via Finnhub /quote (free, IEX). Returns (live, prev) or (None, None) so the
+    caller can fall back to yfinance. c=current price, pc=previous close; c==0 => no data."""
     if not FINNHUB_TOKEN:
         return None, None
     try:
@@ -326,40 +321,21 @@ def yf_live(symbol):
             pass
     return (float(live) if live else None, float(prev) if prev else None)
 
-STALE_NAV_DAYS = 7   # a fund NAV older than this = feed frozen / scheme merged -> surface it
-_STALE_NAVS = []     # collected per run (module-global: one run per process)
-
-def _note_stale(name, last_date):
-    """Record a stale-NAV fund so the snapshot can warn (weekly nag per fund, see run())."""
-    if not last_date:
-        return
-    try:
-        d = dt.datetime.strptime(last_date, "%d-%m-%Y").date()
-    except ValueError:
-        return
-    if (now_ist().date() - d).days > STALE_NAV_DAYS:
-        s = "%s (last NAV %s)" % (name, last_date)
-        if s not in _STALE_NAVS:
-            _STALE_NAVS.append(s)
-
 def _navs_for_code(code):
     h = SESSION.get("https://api.mfapi.in/mf/%s" % code, headers=UA, timeout=20).json()
-    navs, last_date = [], None
-    for x in h.get("data", []):          # mfapi returns newest-first
+    navs = []
+    for x in h.get("data", []):
         try:
             navs.append(float(x["nav"]))
-            if last_date is None:
-                last_date = x.get("date")        # newest NAV's date (dd-mm-YYYY)
         except (ValueError, KeyError):
             pass
     navs.reverse()  # oldest-first
-    return navs, h.get("meta", {}).get("scheme_name", ""), last_date
+    return navs, h.get("meta", {}).get("scheme_name", "")
 
 def mf_closes(c):
     """Resolve a fund robustly. Returns (navs_oldest_first, resolved_name, code)."""
     if c.get("code"):
-        navs, name, last_date = _navs_for_code(c["code"])
-        _note_stale(name or str(c["code"]), last_date)
+        navs, name = _navs_for_code(c["code"])
         return navs, name, c["code"]
     must = [t.lower() for t in c.get("must", [])]
     avoid = [t.lower() for t in c.get("avoid", [])]
@@ -380,8 +356,7 @@ def mf_closes(c):
     best = max(cands, key=score, default=None)
     if not best:
         return [], None, None
-    navs, _, last_date = _navs_for_code(best["schemeCode"])
-    _note_stale(best["schemeName"], last_date)
+    navs, _ = _navs_for_code(best["schemeCode"])
     return navs, best["schemeName"], best["schemeCode"]
 
 
@@ -538,8 +513,7 @@ def metrics(closes, live=None, prev=None, rng=252):
 def metrics_yf(stats, live, prev):
     """Build metrics from cached daily stats + a fresh live/prev (the only intraday-varying bits)."""
     px = live if live is not None else stats["lastclose"]
-    # both live+prev missing -> px IS lastclose; a fake "0.0% today" misleads -> daily n/a instead
-    ref = prev if prev else (stats["lastclose"] if live is not None else None)
+    ref = prev if prev else stats["lastclose"]
     m = _metrics(stats.get("d50"), stats.get("d100"), stats["d200"], stats["peak"], stats["trough"], px, ref)
     m["wk"] = (px / stats["ref5"] - 1) if stats.get("ref5") else None
     return m
@@ -564,7 +538,7 @@ def nav_levels(navs, rng=252):
     return {"d50":  sum(navs[-50:]) / min(50, n) if n >= 20 else None,
             "d100": sum(navs[-100:]) / min(100, n) if n >= 50 else None,
             "d200": sum(navs[-200:]) / min(200, n) if n >= 100 else None,
-            "peak": max(window), "trough": min(window), "allpeak": max(navs),
+            "peak": max(window), "trough": min(window),
             "latest": navs[-1], "prev": navs[-2] if n >= 2 else navs[-1],
             "ref5": (navs[-6] if n >= 6 else None), "n": n}
 
@@ -582,8 +556,6 @@ def metrics_nse(levels, live, prev):
                  sc(levels.get("peak")), sc(levels.get("trough")), live, prev)
     ref5 = levels.get("ref5")
     m["wk"] = ((nav_latest / ref5) * (live / prev) - 1) if (ref5 and prev) else None
-    ap = levels.get("allpeak")
-    m["dd_ath"] = (live / (ap * k) - 1) if ap else None   # ATH context (the NAV history carries it)
     return m
 
 def resolve_bands(c):
@@ -650,6 +622,22 @@ def daily_move_alert(name, daily, thr, side, tier, dstate, today):
     dstate[name] = {"date": today, "side": mv}
     return True
 
+def info_move_alert(name, daily, dstate, today):
+    """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
+    if daily is None:
+        return False
+    if daily <= -INFO_DOWN:
+        mv = "down"
+    elif daily >= INFO_UP:
+        mv = "up"
+    else:
+        return False
+    rec = dstate.get(name, {})
+    if rec.get("date") == today and rec.get("side") == mv:
+        return False
+    dstate[name] = {"date": today, "side": mv}
+    return True
+
 def _late_big(daily):
     """Overnight: asymmetric threshold — +5% up (FYI) / -3% down (actionable)."""
     return daily >= LATE_UP or daily <= -LATE_DOWN
@@ -702,12 +690,12 @@ def snap_block(r):
         head += "  %s" % fmt_level(m["px"])
     l1 = "%s   %s %s %s" % (head, pct(m["daily"]), when, arrow)
     ctx = range_line(m)
-    if name in BOOK_NAMES:   # trim names: 50DMA (timing trigger) + 200DMA (strategic context)
+    if name in BOOK_NAMES or is_us:   # trim names + US rows: 50DMA / 200DMA context line
         dparts = ["%s %s" % (lbl, pct(m[k])) for lbl, k in
                   (("50DMA", "dist50"), ("200DMA", "dist200")) if m.get(k) is not None]
         if dparts:
             ctx = (ctx + "\n" if ctx else "") + " \u00b7 ".join(dparts)
-        if m.get("dd_ath") is not None:   # funds + NSE hybrids (NAV history carries the ATH)
+        if m.get("dd_ath") is not None:   # funds only (nse indices don't carry full history)
             dd = m.get("drawdown")
             if dd is not None and abs(m["dd_ath"] - dd) < 0.001:
                 ctx = ctx.replace("below high", "below all-time high")   # identical -> one line, ATH label
@@ -746,7 +734,7 @@ def fetch_one(c, group_is_us, cache):
             return metrics(navs, None, None, c.get("range_days", 252)), True, is_us
         if c["src"] == "nse":
             code = c["dma_code"]
-            ck = "navlv3_%s" % code   # v3 schema: + allpeak (ATH context)
+            ck = "navlv2_%s" % code   # v2 schema: includes d100
             cc = cache.get(ck)
             if not (cc and cc.get("date") == today_str() and cc.get("levels")):
                 navs, _, _ = mf_closes({"code": code})       # heavy NAV pull -> once per day
@@ -843,8 +831,6 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
     snapshot = force_snapshot or scope == "all"
     phase = us_phase() if (scope == "us" and not snapshot) else "day"
     cache = state.setdefault("_cache", {})
-    for k in [k for k in cache if k.startswith("navlv") and not k.startswith("navlv3_")]:
-        del cache[k]            # prune superseded nav-cache schema versions
     # Sentiment is only used in the snapshot and for day-phase transition pings — skip the two
     # network calls overnight.
     sent = fetch_sentiment() if (snapshot or (phase == "day" and not cutoff_mode)) else {"cnn": None, "mmi": None}
@@ -861,6 +847,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         for name, c in cfg.items():
             if not snapshot and c.get("display_only"):     # only ever shown in the snapshot
                 continue                                   # -> skip its fetch on hourly runs
+            if c.get("us_view") and scope != "us":         # roster rows live only in the `us` view
+                continue
             m, eod, is_us = fetch_one(c, gus, cache)
             if m is None:
                 if c.get("critical"): missing.append(name)
@@ -894,8 +882,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
     # Day hourly (alert-only): tier crossings buy AND sell + DOWN days. Up-days dropped (froth is
     # covered by sell tiers).
     down_moves = [r for r in dmoved if r.m and r.m["daily"] is not None and r.m["daily"] < 0]
-    # Late/overnight: a big single-day move (LATE_DOWN/UP) on live US instruments. Fresh tier
-    # crossings are ALSO sent late (state advances either way; swallowing one = a lost alert).
+    # Late/overnight: ONLY a big single-day move (>=3%, either side) on live US instruments.
     big = []
     if phase == "late":
         etd = now_et().date().isoformat()
@@ -905,7 +892,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                and big_move(r.name, r.m["daily"], state, etd)]
 
     # FYI / awareness tier: gentle pings for INFO_NAMES that moved past the (asymmetric) info band
-    # but are not already going out as actionable. Self-caps ~11pm IST; once per day per side.
+    # but aren't already going out as actionable. Self-caps ~11pm; once per day per side.
     info = []
     if now_ist().time() <= INFO_CUTOFF:
         actionable = {r.name for r in fired}
@@ -915,7 +902,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         for r in rows:
             if r.name not in INFO_NAMES or r.name in actionable:
                 continue
-            if snapshot and r.is_us:        # premarket QQQ in the snapshot -> leave to the hourly US run
+            if snapshot and r.is_us:        # premarket QQQ in the snapshot -> leave to hourly US
                 continue
             if not (r.m and not r.eod and r.m["daily"] is not None):
                 continue
@@ -929,15 +916,6 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
 
     # General snapshot send-gate: not a daily digest. Send only when something is fresh, or a
     # standing booking opportunity is due an occasional reminder. --digest (force) always sends.
-    # Stale-NAV warning (feed frozen / scheme merged): weekly nag per fund, snapshot-only.
-    stale = []
-    if snapshot and _STALE_NAVS:
-        warned = state.setdefault("_stale_warned", {})
-        for s in _STALE_NAVS:
-            nm = s.split(" (")[0]
-            if nm not in warned or _days_since(warned[nm]) >= REMIND_DAYS:
-                warned[nm] = today_str(); stale.append(s)
-
     risk_on, risk_off, risk_lines = _risk(rows, sent)
     cross_notes = cross_events(rows, state) if snapshot else []
     wk_movers   = weekly_movers(rows) if snapshot else []
@@ -953,7 +931,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                         for r in rows)
         send_snap = in_window and (bool(force_snapshot) or bool(fired) or risk_on or risk_off
                                    or bool(missing) or bool(cross_notes) or notable or bool(wk_movers)
-                                   or bool(info) or bool(stale) or (standing and due))
+                                   or bool(info) or (standing and due))
         if send_snap:
             state["_last_snap"] = today_str()
     save_state(state)   # after all state mutations: step_state, sentiment_transition, big_move, anchor
@@ -968,8 +946,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if not send_snap:
             print("Snapshot silent (nothing fresh / out of window)."); _log(rows); return
     elif phase == "late":
-        if not fired and not big and not info and not missing:
-            print("Late US — no >=3%% move."); _log(rows); return
+        if not big and not info and not missing:
+            print("Late US — nothing to report."); _log(rows); return
     else:
         moves = dmoved if scope == "india" else down_moves   # india books on up-moves too
         if not fired and not moves and not info and not strans and not missing:
@@ -982,6 +960,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if sx and sx.m and sx.m.get("daily") is not None:   # lead with the Sensex move (chat preview)
             out.append("%s <b>Sensex %s</b> \u00b7 📊 %s" %
                        ("🔻" if sx.m["daily"] < 0 else "📈", pct(sx.m["daily"]), stamp()))
+        elif scope == "us":
+            out.append("🇺🇸 <b>US TECH</b> — on demand · 📊 %s" % stamp())
         else:
             out.append("📊 <b>MARKET</b> — %s" % stamp())
 
@@ -992,7 +972,8 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
                 "%s %s" % (short(r.name), pct(wk)) for r, wk in wk_movers))
 
         first = True
-        for group in DISPLAY_GROUPS:
+        layout = DISPLAY_GROUPS_US if scope == "us" else DISPLAY_GROUPS
+        for group in layout:
             grp = [by_name[n] for n in group if n in by_name]
             if not grp:
                 continue
@@ -1017,7 +998,7 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         deploy = sorted([r for r in rows if r.snap and r.name in DEPLOY_NAMES and r.side == "buy"],
                         key=lambda r: -(r.tier or 0))
         if deploy:
-            out.append("\n🟢 <b>Deploy signal</b> — India large/large-mid in the staged buy zone")
+            out.append("\n🟢 <b>Deploy signal</b> — staged buy zone (fresh capital)")
             out += ["🟢 DEPLOY-T%d  %s  %s off 1y peak" % (r.tier, short(r.name), pct(r.m["drawdown"]))
                     for r in deploy]
 
@@ -1027,9 +1008,6 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
             out.append("\n📌 <b>Fund alerts</b>")
             out += [_reason(r) for r in ff]
 
-        if stale:
-            out.append("\n⚠️ <b>stale NAV</b> (feed frozen?): %s" % ", ".join(stale))
-
         heads_news = fetch_headlines()
         if heads_news:
             out.append("")
@@ -1038,9 +1016,6 @@ def run(scope, force_snapshot=False, cutoff_mode=None):
         if missing:
             out.append("\n⚠️ couldn't fetch: %s — %s" % (", ".join(missing), CRITICAL_HINT))
     elif phase == "late":
-        if fired:   # tier crossings are rare + actionable -> never swallow them overnight
-            out.append("⚠️ <b>US TECH</b> — %s" % stamp())
-            out += [_reason(r) for r in fired]
         if big:
             out.append("⚠️ <b>US — BIG MOVE</b> (overnight) — %s" % stamp())
             out += [_dmove(r) for r in big]
@@ -1080,34 +1055,16 @@ def _reason(r):
             return "🟢 DEPLOY-T%d  %s  %s off 1y peak" % (tier, short(name), pct(m["drawdown"]))
         return "🔻 %s  %s off peak  (%s vs 200DMA)" % (
             short(name), pct(m["drawdown"]), pct(m["dist200"]))
-    dd = m.get("drawdown")
-    ctx = ("  · %s off 1y peak" % pct(dd)) if dd is not None else ""
-    return "💰 %s  trim — %s vs %s%s" % (short(name), pct(ref), lbl, ctx)
+    return "💰 %s  trim — %s vs %s" % (short(name), pct(ref), lbl)
 
-def info_move_alert(name, daily, dstate, today):
-    """FYI awareness ping. Asymmetric band (down -INFO_DOWN, up +INFO_UP), once per day per side."""
-    if daily is None:
-        return False
-    if daily <= -INFO_DOWN:
-        mv = "down"
-    elif daily >= INFO_UP:
-        mv = "up"
-    else:
-        return False
-    rec = dstate.get(name, {})
-    if rec.get("date") == today and rec.get("side") == mv:
-        return False
-    dstate[name] = {"date": today, "side": mv}
-    return True
+def _dmove(r):
+    m = r.m
+    return "%s %s %s today" % ("🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
 
 def _info_line(r):
     m = r.m
     return "ℹ️ %s %s %s today — FYI, no action" % (
         "🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
-
-def _dmove(r):
-    m = r.m
-    return "%s %s %s today" % ("🔻" if m["daily"] < 0 else "📈", short(r.name), pct(m["daily"]))
 
 def _india_cutoff(rows, state, mode):
     """MF-cutoff re-runs. Compares live India values to the anchor snapshot and alerts only on
@@ -1219,18 +1176,15 @@ def main(scope, force_snapshot=False, cutoff_mode=None):
         raise
 
 
-# ---- inbound poll (bidirectional "/status" digest) -----------------------------
-# On-demand pull: text the bot/group a trigger word and get the full snapshot back. A cron runs
-# this every minute (no webhook/daemon needed) — it reads getUpdates, and if the configured chat
-# sent a trigger since the last poll, fires a digest. tg_offset is persisted BEFORE the send so a
-# crash can't loop-spam, and only the configured CHAT_ID is honoured (everyone else is ignored).
-POLL_TRIGGERS = {"/status", "status", "/digest", "digest", "/market", "market",
-                 "snapshot", "ping", "hi"}
-POLL_HELP = {"/help", "help", "/start"}
+POLL_TRIGGERS = {"/status", "status", "hi", "digest", "market", "snapshot", "ping",
+                 "/us", "us"}   # "us" -> US-only snapshot; everything else -> full digest
 
 def poll_telegram():
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        sys.exit("Set TELEGRAM_TOKEN and TELEGRAM_CHAT_ID (see .env.example).")
+    """Cron-driven inbound poll (no webhook/daemon): if the configured chat sent a trigger word
+    since the last poll, fire a full digest. The offset is persisted BEFORE sending so a crash can't
+    loop-spam, and only the configured CHAT_ID is honoured."""
+    if not TELEGRAM_TOKEN:
+        sys.exit("No TELEGRAM_TOKEN set.")
     state = load_state()
     offset = state.get("tg_offset", 0)
     try:
@@ -1239,29 +1193,59 @@ def poll_telegram():
         updates = d.get("result", [])
     except Exception as ex:
         print("   [poll] getUpdates fail: %s" % ex); return
-    want, trigger, helped = str(CHAT_ID), False, False
+    want, mode = str(CHAT_ID), None
     for u in updates:
         offset = max(offset, u.get("update_id", offset))
         msg = u.get("message") or u.get("edited_message") or {}
         chat = str((msg.get("chat") or {}).get("id", ""))
         text = (msg.get("text") or "").strip().lower()
-        word = text.split("@")[0].split()[0] if text else ""   # strip @botname in groups
-        if not (want and chat == want):
-            continue
-        if word in POLL_TRIGGERS:
-            trigger = True
-        elif word in POLL_HELP:
-            helped = True
-    state["tg_offset"] = offset           # persist BEFORE sending (crash-safe, no re-trigger)
+        word = text.split("@")[0].split()[0] if text else ""
+        if want and chat == want and word in POLL_TRIGGERS:
+            mode = "us" if word.lstrip("/") == "us" else "all"   # last trigger wins
+    state["tg_offset"] = offset           # persist BEFORE sending (crash-safe)
     save_state(state)
-    if trigger:
-        print("poll: trigger -> digest."); main("all", force_snapshot=True)
-    elif helped:
-        print("poll: help.")
-        send_telegram("\U0001F916 <b>market_alerts</b> — text <code>status</code> for the live "
-                      "snapshot. Otherwise I stay silent unless a market hits an extreme.")
+    if mode:
+        print("poll: trigger -> %s snapshot." % mode); main(mode, force_snapshot=True)
     else:
         print("poll: %d update(s), no trigger." % len(updates))
+
+
+def listen_telegram():
+    """Long-polling daemon (--listen): Telegram holds the getUpdates request open (~25s) and
+    returns the instant a message arrives -> near-instant replies with FEWER requests than any
+    cron polling. Run under systemd (Restart=always); do NOT also run the --poll cron."""
+    if not TELEGRAM_TOKEN:
+        sys.exit("No TELEGRAM_TOKEN set.")
+    print("listen: long-poll loop started.")
+    while True:
+        offset = load_state().get("tg_offset", 0)
+        try:
+            d = SESSION.get("https://api.telegram.org/bot%s/getUpdates" % TELEGRAM_TOKEN,
+                            params={"offset": offset + 1, "timeout": 25}, timeout=35).json()
+            updates = d.get("result", [])
+        except Exception as ex:
+            print("listen: getUpdates fail: %s" % ex); time.sleep(5); continue
+        if not updates:
+            continue
+        want, mode = str(CHAT_ID), None
+        for u in updates:
+            offset = max(offset, u.get("update_id", offset))
+            msg = u.get("message") or u.get("edited_message") or {}
+            chat = str((msg.get("chat") or {}).get("id", ""))
+            text = (msg.get("text") or "").strip().lower()
+            word = text.split("@")[0].split()[0] if text else ""
+            if want and chat == want and word in POLL_TRIGGERS:
+                mode = "us" if word.lstrip("/") == "us" else "all"
+        state = load_state()                  # reload fresh to keep the write window tiny
+        state["tg_offset"] = offset           # persist BEFORE sending (crash-safe)
+        save_state(state)
+        if mode:
+            print("listen: trigger -> %s snapshot." % mode)
+            _NSE.clear()   # per-process NSE spot cache would go stale in a long-lived daemon
+            try:
+                main(mode, force_snapshot=True)
+            except Exception as ex:
+                print("listen: run failed: %s" % ex)   # keep the loop alive
 
 
 if __name__ == "__main__":
@@ -1296,6 +1280,8 @@ if __name__ == "__main__":
         calibrate()
     elif "--poll" in args:
         poll_telegram()
+    elif "--listen" in args:
+        listen_telegram()
     elif "--digest" in args:
         main("all", force_snapshot=True)
     else:
